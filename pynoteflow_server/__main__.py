@@ -13,6 +13,12 @@ import argparse
 import asyncio
 import sys
 
+# Ensure UTF-8 output even when launched with a cp1252 console (background/silent mode)
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
 
 def main():
     parser = argparse.ArgumentParser(

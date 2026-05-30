@@ -210,7 +210,7 @@ async def run_server(host: str = "localhost", port: int = 5891) -> None:
     print(f"  Listening on  http://{host}:{port}")
     print(f"  Python        {sys.version.split()[0]}")
     print()
-    print("  Open PyNoteFlow and click  ⚡ Connect Kernel")
+    print("  Open PyNoteFlow and click  [Connect Kernel]")
     print("  then choose  'PyNoteFlow Server (localhost)'")
     print()
     print("  Press  Ctrl+C  to stop.")
