@@ -64,7 +64,13 @@ async def handle_ping(request: web.Request) -> web.Response:
 async def handle_info(request: web.Request) -> web.Response:
     bridge: KernelBridge = request.app["bridge"]
     info = get_server_info()
-    info["kernel_alive"] = bridge.km is not None and bridge.km.is_alive()
+    try:
+        ka = bridge.km.is_alive() if bridge.km is not None else False
+        if asyncio.iscoroutine(ka):
+            ka = await ka
+        info["kernel_alive"] = bool(ka)
+    except Exception:
+        info["kernel_alive"] = False
     return web.json_response(info)
 
 
