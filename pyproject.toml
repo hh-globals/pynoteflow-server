@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pynoteflow-server"
+version = "1.0.0"
+description = "Lightweight local kernel server for PyNoteFlow"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "H&H Globals", email = "contact@hh-globals.com" }]
+dependencies = [
+    "aiohttp>=3.9",
+    "jupyter-client>=7.0",
+    "ipykernel>=6.0",
+]
+
+[project.scripts]
+pynoteflow-server = "pynoteflow_server.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pynoteflow_server*"]
