@@ -5,6 +5,7 @@ Endpoints:
   GET  /ping          Health check → { status: 'ok', version: '1.0.0' }
   GET  /info          Kernel info  → { python_version, cwd, platform, ... }
   GET  /ws            WebSocket — single persistent connection for the extension
+  GET  /ws/pty        WebSocket — PTY terminal session (one per connection)
   POST /restart       Restart the kernel → { status: 'restarting' }
   POST /interrupt     Interrupt the kernel → { status: 'interrupted' }
 
@@ -15,6 +16,8 @@ CORS:
 import asyncio
 import json
 import logging
+import os
+import shlex
 import sys
 from aiohttp import web, WSMsgType
 
@@ -27,6 +30,8 @@ _ALLOWED_ORIGIN_PREFIXES = (
     "ms-browser-extension://",
     "http://localhost",
     "http://127.0.0.1",
+    "null",      # regular browsers send Origin: null for file:// pages
+    "file://",   # Electron (VS Code) sends Origin: file:// for file:// pages
 )
 
 
@@ -173,6 +178,177 @@ async def _dispatch(bridge: KernelBridge, ws, data: dict) -> None:
         await ws.send_json({"type": "pong"})
 
 
+# ── PTY terminal WebSocket handler ────────────────────────────────────────────
+#
+# Protocol (text frames only):
+#   client → server:  { "type": "input",  "data": "<chars>" }
+#                     { "type": "resize", "cols": N, "rows": N }
+#   server → client:  { "type": "output", "data": "<chars>" }
+#                     { "type": "exit",   "code": N }
+#
+# On Unix    — uses pty.openpty() for a real PTY with full ANSI support.
+# On Windows — uses pywinpty (ConPTY, Windows 10 1809+) for a real PTY.
+
+async def handle_ws_pty(request: web.Request) -> web.WebSocketResponse:
+    origin = request.headers.get("Origin")
+    if not _is_allowed_origin(origin):
+        raise web.HTTPForbidden(reason="Origin not allowed")
+
+    ws = web.WebSocketResponse(heartbeat=30)
+    await ws.prepare(request)
+
+    _IS_WIN = sys.platform == "win32"
+
+    if _IS_WIN:
+        # Windows: pywinpty — real ConPTY (requires pywinpty package)
+        try:
+            import winpty
+        except ImportError:
+            await ws.send_json({"type": "output", "data":
+                "\r\n\x1b[31mError: pywinpty not installed.\x1b[0m\r\n"
+                "Run:  pip install pywinpty  then restart the server.\r\n"})
+            return ws
+
+        loop = asyncio.get_event_loop()
+        shell = "powershell.exe"
+        pty_proc = await loop.run_in_executor(
+            None, lambda: winpty.PtyProcess.spawn(shell, dimensions=(24, 220)))
+
+        def _winpty_read(p):
+            """Blocking read — runs in executor thread."""
+            try:
+                data = p.read(4096)   # blocks until data available or EOF
+                return data           # str; empty string means no data yet
+            except EOFError:
+                return None
+            except Exception:
+                return None
+
+        async def _read_winpty():
+            try:
+                while pty_proc.isalive():
+                    chunk = await loop.run_in_executor(
+                        None, lambda: _winpty_read(pty_proc))
+                    if chunk is None:
+                        break
+                    if chunk and not ws.closed:
+                        await ws.send_json({"type": "output", "data": chunk})
+            except Exception:
+                pass
+            if not ws.closed:
+                await ws.send_json({"type": "exit", "code": getattr(pty_proc, 'exitstatus', 0) or 0})
+
+        read_task = asyncio.ensure_future(_read_winpty())
+
+        try:
+            async for msg in ws:
+                if msg.type == WSMsgType.TEXT:
+                    try:
+                        data = json.loads(msg.data)
+                    except Exception:
+                        continue
+                    if data.get("type") == "input":
+                        text = data.get("data", "")
+                        await loop.run_in_executor(None, lambda t=text: pty_proc.write(t))
+                    elif data.get("type") == "resize":
+                        cols = int(data.get("cols", 80))
+                        rows = int(data.get("rows", 24))
+                        await loop.run_in_executor(
+                            None, lambda c=cols, r=rows: pty_proc.setwinsize(r, c))
+                elif msg.type in (WSMsgType.ERROR, WSMsgType.CLOSE):
+                    break
+        finally:
+            read_task.cancel()
+            try:
+                pty_proc.terminate(force=True)
+            except Exception:
+                pass
+
+    else:
+        # Unix: real PTY via pty module
+        import pty
+        import fcntl
+        import termios
+        import struct
+
+        master_fd, slave_fd = pty.openpty()
+
+        shell = os.environ.get("SHELL", "/bin/bash")
+        env = {**os.environ, "TERM": "xterm-256color"}
+        proc = await asyncio.create_subprocess_exec(
+            shell,
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            close_fds=True,
+            env=env,
+        )
+        os.close(slave_fd)
+
+        loop = asyncio.get_event_loop()
+
+        async def _read_pty():
+            try:
+                while True:
+                    chunk = await loop.run_in_executor(None, lambda: _safe_read(master_fd))
+                    if chunk is None:
+                        break
+                    try:
+                        text = chunk.decode("utf-8", errors="replace")
+                    except Exception:
+                        text = chunk.decode("latin-1", errors="replace")
+                    if not ws.closed:
+                        await ws.send_json({"type": "output", "data": text})
+            except Exception:
+                pass
+            if not ws.closed:
+                await ws.send_json({"type": "exit", "code": proc.returncode or 0})
+
+        def _safe_read(fd):
+            import select, errno
+            try:
+                r, _, _ = select.select([fd], [], [], 0.05)
+                if r:
+                    return os.read(fd, 4096)
+                return b""
+            except OSError as e:
+                if e.errno in (errno.EIO, errno.EBADF):
+                    return None
+                return b""
+
+        read_task = asyncio.ensure_future(_read_pty())
+
+        try:
+            async for msg in ws:
+                if msg.type == WSMsgType.TEXT:
+                    try:
+                        data = json.loads(msg.data)
+                    except Exception:
+                        continue
+                    if data.get("type") == "input":
+                        text = data.get("data", "")
+                        os.write(master_fd, text.encode("utf-8", errors="replace"))
+                    elif data.get("type") == "resize":
+                        cols = int(data.get("cols", 80))
+                        rows = int(data.get("rows", 24))
+                        win = struct.pack("HHHH", rows, cols, 0, 0)
+                        fcntl.ioctl(master_fd, termios.TIOCSWINSZ, win)
+                elif msg.type in (WSMsgType.ERROR, WSMsgType.CLOSE):
+                    break
+        finally:
+            read_task.cancel()
+            try:
+                os.close(master_fd)
+            except Exception:
+                pass
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+    return ws
+
+
 # ── App factory & runner ──────────────────────────────────────────────────────
 
 async def create_app() -> web.Application:
@@ -183,6 +359,7 @@ async def create_app() -> web.Application:
     app.router.add_get("/ping", handle_ping)
     app.router.add_get("/info", handle_info)
     app.router.add_get("/ws", handle_ws)
+    app.router.add_get("/ws/pty", handle_ws_pty)
     app.router.add_post("/restart", handle_restart)
     app.router.add_post("/interrupt", handle_interrupt)
     # Preflight

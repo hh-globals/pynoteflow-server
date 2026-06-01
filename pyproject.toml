@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pynoteflow-server"
-version = "1.0.0"
+version = "1.0.1"
 description = "Lightweight local kernel server for PyNoteFlow"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -14,6 +14,7 @@ dependencies = [
     "aiohttp>=3.9",
     "jupyter-client>=7.0",
     "ipykernel>=6.0",
+    "pywinpty>=2.0; sys_platform == 'win32'",
 ]
 
 [project.scripts]

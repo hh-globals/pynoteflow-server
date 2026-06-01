@@ -76,9 +76,28 @@ class KernelBridge:
         logger.info("Kernel stopped")
 
     async def restart(self) -> None:
+        # Cancel message-consuming loops before calling wait_for_ready().
+        # Without this, _shell_loop() races with wait_for_ready() for the
+        # kernel_info_reply on the shell ZMQ channel; if _shell_loop() wins
+        # that race, wait_for_ready() never sees the reply and blocks for the
+        # full 60-second timeout — freezing the WebSocket dispatch loop.
+        for task in (self._iopub_task, self._shell_task, self._stdin_task):
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        self._iopub_task = self._shell_task = self._stdin_task = None
+
         self._exec_map.clear()
         await self.km.restart_kernel()
         await asyncio.wait_for(self.kc.wait_for_ready(), timeout=60)
+
+        # Restart message loops for the fresh kernel
+        self._iopub_task = asyncio.create_task(self._iopub_loop(), name="iopub")
+        self._shell_task = asyncio.create_task(self._shell_loop(), name="shell")
+        self._stdin_task = asyncio.create_task(self._stdin_loop(), name="stdin")
         logger.info("Kernel restarted")
 
     async def interrupt(self) -> None:
@@ -111,41 +130,35 @@ class KernelBridge:
     async def _iopub_loop(self) -> None:
         while True:
             try:
-                msg = await asyncio.wait_for(self.kc.get_iopub_msg(), timeout=0.1)
+                msg = await self.kc.get_iopub_msg()
                 await self._handle_iopub(msg)
-            except asyncio.TimeoutError:
-                pass
             except asyncio.CancelledError:
                 break
             except Exception as exc:
                 logger.debug("iopub loop: %s", exc)
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(0)
 
     async def _shell_loop(self) -> None:
         while True:
             try:
-                msg = await asyncio.wait_for(self.kc.get_shell_msg(), timeout=0.1)
+                msg = await self.kc.get_shell_msg()
                 await self._handle_shell(msg)
-            except asyncio.TimeoutError:
-                pass
             except asyncio.CancelledError:
                 break
             except Exception as exc:
                 logger.debug("shell loop: %s", exc)
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(0)
 
     async def _stdin_loop(self) -> None:
         while True:
             try:
-                msg = await asyncio.wait_for(self.kc.get_stdin_msg(), timeout=0.1)
+                msg = await self.kc.get_stdin_msg()
                 await self._handle_stdin(msg)
-            except asyncio.TimeoutError:
-                pass
             except asyncio.CancelledError:
                 break
             except Exception as exc:
                 logger.debug("stdin loop: %s", exc)
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(0)
 
     # ── Message translators ───────────────────────────────────────────────────
 
