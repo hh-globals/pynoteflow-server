@@ -25,8 +25,9 @@ import asyncio
 import logging
 import os
 import platform
+import re
 import sys
-import uuid
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,15 @@ class KernelBridge:
         self._stdin_task = None
         # Map kernel msg_id → client msg_id
         self._exec_map: dict[str, str] = {}
+        # Map kernel msg_id -> execution metadata (e.g. install commands)
+        self._exec_meta: dict[str, dict] = {}
+        # Server-side guard: reject concurrent/duplicate pip installs even if
+        # a buggy client dispatches duplicate execute requests.
+        self._install_active = False
+        self._install_active_msg_id: str | None = None
+        self._last_install_fingerprint = ""
+        self._last_install_ts = 0.0
+        self._install_dedupe_window_s = 8.0
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -91,6 +101,9 @@ class KernelBridge:
         self._iopub_task = self._shell_task = self._stdin_task = None
 
         self._exec_map.clear()
+        self._exec_meta.clear()
+        self._install_active = False
+        self._install_active_msg_id = None
         await self.km.restart_kernel()
         await asyncio.wait_for(self.kc.wait_for_ready(), timeout=60)
 
@@ -113,9 +126,81 @@ class KernelBridge:
 
     # ── Client commands ──────────────────────────────────────────────────────
 
-    def execute(self, code: str, client_msg_id: str) -> None:
+    @staticmethod
+    def _extract_install_target(code: str) -> str:
+        """Best-effort package token extraction from pip install snippets."""
+        # Path 1: explicit shell command, e.g. !pip install torch --index-url ...
+        m = re.search(r"pip\s+install\s+([^\s\"']+)", code, flags=re.IGNORECASE)
+        if m:
+            target = m.group(1).strip()
+            if target and not target.startswith("-"):
+                return target
+        # Path 2: extension-generated python wrapper with _pargs = ['install', ...]
+        m = re.search(r"_pargs\s*=\s*\[(.*?)\]", code, flags=re.DOTALL)
+        if m:
+            raw = m.group(1)
+            toks = re.findall(r"['\"]([^'\"]+)['\"]", raw)
+            if toks:
+                if toks[0].lower() == "install" and len(toks) > 1:
+                    for t in toks[1:]:
+                        if t and not t.startswith("-"):
+                            return t
+                if toks[0].lower() != "install":
+                    return toks[0]
+        return ""
+
+    @staticmethod
+    def _is_install_command(code: str) -> bool:
+        c = (code or "").lower()
+        if "pip uninstall" in c:
+            return False
+        if re.search(r"(^|\W)pip\s+install(\s|$)", c):
+            return True
+        if "\"-m\", \"pip\"" in c and "'install'" in c:
+            return True
+        if "\"-m\", \"pip\"" in c and '"install"' in c:
+            return True
+        if "_pargs" in c and "install" in c and "pip" in c:
+            return True
+        return False
+
+    async def execute(self, code: str, client_msg_id: str) -> None:
+        is_install = self._is_install_command(code)
+        pkg = self._extract_install_target(code)
+        if is_install:
+            now = time.time()
+            fingerprint = f"{pkg}|{code.strip()[:300]}"
+            # Reject exact duplicate install burst (double-click / race)
+            if (
+                self._last_install_fingerprint == fingerprint
+                and (now - self._last_install_ts) < self._install_dedupe_window_s
+            ):
+                await self._send({
+                    "type": "error",
+                    "msg_id": client_msg_id,
+                    "ename": "DuplicateInstall",
+                    "evalue": f"Duplicate install ignored for '{pkg or 'package'}' (already started).",
+                    "traceback": [],
+                })
+                return
+            # Reject concurrent install while another one is active
+            if self._install_active:
+                await self._send({
+                    "type": "error",
+                    "msg_id": client_msg_id,
+                    "ename": "InstallBusy",
+                    "evalue": "Another package install is still running. Please wait for completion.",
+                    "traceback": [],
+                })
+                return
+            self._install_active = True
+            self._last_install_fingerprint = fingerprint
+            self._last_install_ts = now
         kernel_msg_id = self.kc.execute(code, store_history=True)
         self._exec_map[kernel_msg_id] = client_msg_id
+        self._exec_meta[kernel_msg_id] = {"is_install": is_install, "pkg": pkg}
+        if is_install:
+            self._install_active_msg_id = kernel_msg_id
 
     async def complete(self, code: str, cursor_pos: int, client_msg_id: str) -> None:
         kernel_msg_id = self.kc.complete(code, cursor_pos)
@@ -224,6 +309,10 @@ class KernelBridge:
         content = msg.get("content", {})
 
         if mt == "execute_reply":
+            meta = self._exec_meta.pop(parent_id, {})
+            if meta.get("is_install") and parent_id == self._install_active_msg_id:
+                self._install_active = False
+                self._install_active_msg_id = None
             self._exec_map.pop(parent_id, None)
             await self._send({
                 "type": "execute_reply",
@@ -233,6 +322,7 @@ class KernelBridge:
             })
 
         elif mt == "complete_reply":
+            self._exec_meta.pop(parent_id, None)
             self._exec_map.pop(parent_id, None)
             await self._send({
                 "type": "complete_reply",
@@ -264,5 +354,5 @@ def get_server_info() -> dict:
         "python_version": sys.version,
         "cwd": os.getcwd(),
         "platform": platform.platform(),
-        "server_version": "1.0.0",
+        "server_version": "1.0.2",
     }

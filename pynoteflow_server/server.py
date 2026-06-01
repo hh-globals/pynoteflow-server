@@ -63,7 +63,7 @@ async def cors_middleware(request: web.Request, handler):
 # ── HTTP handlers ─────────────────────────────────────────────────────────────
 
 async def handle_ping(request: web.Request) -> web.Response:
-    return web.json_response({"status": "ok", "version": "1.0.0", "server": "pynoteflow"})
+    return web.json_response({"status": "ok", "version": "1.0.2", "server": "pynoteflow"})
 
 
 async def handle_info(request: web.Request) -> web.Response:
@@ -153,7 +153,7 @@ async def _dispatch(bridge: KernelBridge, ws, data: dict) -> None:
             await ws.send_json({"type": "error", "msg_id": None, "ename": "ProtocolError",
                                 "evalue": "msg_id required", "traceback": []})
             return
-        bridge.execute(code, msg_id)
+        await bridge.execute(code, msg_id)
 
     elif t == "interrupt":
         await bridge.interrupt()
