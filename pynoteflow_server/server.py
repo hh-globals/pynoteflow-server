@@ -21,7 +21,7 @@ import shlex
 import sys
 from aiohttp import web, WSMsgType
 
-from .kernel_bridge import KernelBridge, get_server_info
+from .kernel_bridge import KernelBridge, get_server_info, get_kernel_python, _load_pnf_config, save_pnf_config
 
 logger = logging.getLogger(__name__)
 
@@ -209,10 +209,19 @@ async def handle_ws_pty(request: web.Request) -> web.WebSocketResponse:
                 "Run:  pip install pywinpty  then restart the server.\r\n"})
             return ws
 
+        # Prepend the kernel's Python Scripts dir to PATH so pip/python in
+        # the PTY shell resolves to the same environment as the kernel.
+        _py_scripts = os.path.dirname(get_kernel_python())
+        _pty_env = dict(os.environ)
+        _pty_env['PATH'] = _py_scripts + os.pathsep + _pty_env.get('PATH', '')
+        # Propagate virtual environment if the server is running inside one.
+        if sys.prefix != getattr(sys, 'base_prefix', sys.prefix):
+            _pty_env['VIRTUAL_ENV'] = sys.prefix
+
         loop = asyncio.get_event_loop()
         shell = "powershell.exe"
         pty_proc = await loop.run_in_executor(
-            None, lambda: winpty.PtyProcess.spawn(shell, dimensions=(24, 220)))
+            None, lambda: winpty.PtyProcess.spawn(shell, env=_pty_env, dimensions=(24, 220)))
 
         def _winpty_read(p):
             """Blocking read — runs in executor thread."""
@@ -274,7 +283,13 @@ async def handle_ws_pty(request: web.Request) -> web.WebSocketResponse:
         master_fd, slave_fd = pty.openpty()
 
         shell = os.environ.get("SHELL", "/bin/bash")
-        env = {**os.environ, "TERM": "xterm-256color"}
+        # Prepend kernel's Python bin dir so pip/python in the PTY shell
+        # resolves to the same environment as the kernel.
+        _py_bin = os.path.dirname(get_kernel_python())
+        _path_env = _py_bin + os.pathsep + os.environ.get('PATH', '')
+        env = {**os.environ, "TERM": "xterm-256color", "PATH": _path_env}
+        if sys.prefix != getattr(sys, 'base_prefix', sys.prefix):
+            env['VIRTUAL_ENV'] = sys.prefix
         proc = await asyncio.create_subprocess_exec(
             shell,
             stdin=slave_fd,
@@ -349,6 +364,30 @@ async def handle_ws_pty(request: web.Request) -> web.WebSocketResponse:
     return ws
 
 
+# ── Config endpoints ──────────────────────────────────────────────────────────
+
+async def handle_get_config(request: web.Request) -> web.Response:
+    """GET /config — return current PNF config + active kernel Python path."""
+    cfg = dict(_load_pnf_config())
+    cfg["_kernel_python_active"] = get_kernel_python()
+    cfg["_server_python"] = sys.executable
+    return web.json_response(cfg)
+
+
+async def handle_post_config(request: web.Request) -> web.Response:
+    """POST /config — update PNF config (e.g. kernel_python path)."""
+    try:
+        data = await request.json()
+    except Exception:
+        raise web.HTTPBadRequest(reason="Invalid JSON")
+    if "kernel_python" in data:
+        kp = data["kernel_python"]
+        if kp and not os.path.isfile(kp):
+            return web.json_response({"error": f"Python executable not found: {kp}"}, status=400)
+    save_pnf_config(data)
+    return web.json_response({"status": "ok", "config": _load_pnf_config()})
+
+
 # ── App factory & runner ──────────────────────────────────────────────────────
 
 async def create_app() -> web.Application:
@@ -362,6 +401,8 @@ async def create_app() -> web.Application:
     app.router.add_get("/ws/pty", handle_ws_pty)
     app.router.add_post("/restart", handle_restart)
     app.router.add_post("/interrupt", handle_interrupt)
+    app.router.add_get("/config", handle_get_config)
+    app.router.add_post("/config", handle_post_config)
     # Preflight
     app.router.add_route("OPTIONS", "/{path_info:.*}", lambda r: web.Response())
 
