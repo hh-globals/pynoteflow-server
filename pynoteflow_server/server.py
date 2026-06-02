@@ -68,7 +68,7 @@ async def cors_middleware(request: web.Request, handler):
 # ── HTTP handlers ─────────────────────────────────────────────────────────────
 
 async def handle_ping(request: web.Request) -> web.Response:
-    return web.json_response({"status": "ok", "version": "1.0.4", "server": "pynoteflow"})
+    return web.json_response({"status": "ok", "version": __version__, "server": "pynoteflow"})
 
 
 async def handle_info(request: web.Request) -> web.Response:
@@ -504,10 +504,48 @@ async def run_server(host: str = "localhost", port: int = 5891) -> None:
     site = web.TCPSite(runner, host, port)
     await site.start()
 
+    # Auto-register a Jupyter kernelspec for the current kernel_python, so
+    # Jupyter users see the same interpreter the PNF server is using without
+    # any manual setup. This is idempotent — re-registering the same path is
+    # a no-op apart from updating the kernelspec metadata.
+    _kp = get_kernel_python()
+
+    # If the kernel python is the PNF server's own uv-tool env, uv strips
+    # pip during install. Re-add pip so the PTY's `pip` override actually
+    # works (it routes to `<kp> -m pip`).
+    if _kp == sys.executable:
+        try:
+            import importlib
+            try:
+                importlib.import_module("pip")
+            except ImportError:
+                import subprocess as _sp
+                logging.info("Bootstrapping pip into kernel env via ensurepip…")
+                _sp.run([_kp, "-m", "ensurepip", "--upgrade"],
+                        capture_output=True, timeout=120)
+        except Exception as _e:
+            logging.warning("ensurepip skipped: %s", _e)
+
+    try:
+        loop = asyncio.get_event_loop()
+        ks_result = await loop.run_in_executor(
+            None, register_jupyter_kernelspec, _kp)
+        if ks_result.get("ok"):
+            logging.info(
+                "Registered Jupyter kernelspec '%s' → %s",
+                ks_result.get("name", "?"), _kp)
+        else:
+            logging.warning(
+                "Could not register Jupyter kernelspec: %s",
+                ks_result.get("log", "(unknown)")[:200])
+    except Exception as _e:
+        logging.warning("Kernelspec auto-register skipped: %s", _e)
+
     print("=" * 60)
     print(f"  PyNoteFlow Server  v{__version__}")
     print(f"  Listening on  http://{host}:{port}")
     print(f"  Python        {sys.version.split()[0]}")
+    print(f"  Kernel        {_kp}")
     print()
     print("  Open PyNoteFlow and click  [Connect Kernel]")
     print("  then choose  'PyNoteFlow Server (localhost)'")

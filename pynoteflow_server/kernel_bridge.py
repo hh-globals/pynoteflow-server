@@ -63,13 +63,13 @@ def get_kernel_python() -> str:
 
     Priority:
       1. 'kernel_python' key in ~/.pynoteflow/config.json (explicit user setting)
-      2. First 'python' / 'python3' found in PATH that is NOT the Windows Store
-         app-execution-alias stub (those live under …\\WindowsApps\\).
-      3. sys.executable (the PNF server's own Python, last resort)
-
-    This ensures that by default the kernel runs in the user's main Python
-    environment (with all their installed packages) rather than whichever
-    sandboxed Python happens to be running the PNF server.
+      2. sys.executable — the PNF server's OWN Python. By design the server is
+         installed via `uv tool install pynoteflow-server`, so this is the
+         dedicated uv-tool interpreter at
+         `~/AppData/Roaming/uv/tools/pynoteflow-server/Scripts/python.exe`
+         (or the equivalent on macOS/Linux). Using this as the universal
+         default means PNF kernel, PNF PTY, and the auto-registered Jupyter
+         kernelspec all share ONE interpreter — exactly what the user wants.
     """
     try:
         kp = _load_pnf_config().get('kernel_python', '')
@@ -77,15 +77,6 @@ def get_kernel_python() -> str:
             return kp
     except Exception:
         pass
-
-    # Auto-detect: search PATH for a real Python, skipping Windows Store stubs.
-    import shutil as _shutil
-    _winapps = os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Microsoft', 'WindowsApps')
-    for _cmd in ('python', 'python3'):
-        _found = _shutil.which(_cmd)
-        if _found and os.path.isfile(_found) and _winapps.lower() not in _found.lower():
-            return _found
-
     return sys.executable
 
 
@@ -462,13 +453,14 @@ class KernelBridge:
 
 
 def get_server_info() -> dict:
+    from . import __version__ as _v
     kp = get_kernel_python()
     return {
         "type": "info",
         "python_version": sys.version,
         "cwd": os.getcwd(),
         "platform": platform.platform(),
-        "server_version": "1.0.4",
+        "server_version": _v,
         "kernel_python": kp,
     }
 
