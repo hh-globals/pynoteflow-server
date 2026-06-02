@@ -21,6 +21,7 @@ import shlex
 import sys
 from aiohttp import web, WSMsgType
 
+from . import __version__
 from .kernel_bridge import (
     KernelBridge, get_server_info, get_kernel_python,
     _load_pnf_config, save_pnf_config,
@@ -504,7 +505,7 @@ async def run_server(host: str = "localhost", port: int = 5891) -> None:
     await site.start()
 
     print("=" * 60)
-    print(f"  PyNoteFlow Server  v1.0.0")
+    print(f"  PyNoteFlow Server  v{__version__}")
     print(f"  Listening on  http://{host}:{port}")
     print(f"  Python        {sys.version.split()[0]}")
     print()
