@@ -21,7 +21,11 @@ import shlex
 import sys
 from aiohttp import web, WSMsgType
 
-from .kernel_bridge import KernelBridge, get_server_info, get_kernel_python, _load_pnf_config, save_pnf_config
+from .kernel_bridge import (
+    KernelBridge, get_server_info, get_kernel_python,
+    _load_pnf_config, save_pnf_config,
+    discover_pythons, register_jupyter_kernelspec, _kernelspec_name_for,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +67,7 @@ async def cors_middleware(request: web.Request, handler):
 # ── HTTP handlers ─────────────────────────────────────────────────────────────
 
 async def handle_ping(request: web.Request) -> web.Response:
-    return web.json_response({"status": "ok", "version": "1.0.2", "server": "pynoteflow"})
+    return web.json_response({"status": "ok", "version": "1.0.4", "server": "pynoteflow"})
 
 
 async def handle_info(request: web.Request) -> web.Response:
@@ -211,7 +215,8 @@ async def handle_ws_pty(request: web.Request) -> web.WebSocketResponse:
 
         # Prepend the kernel's Python Scripts dir to PATH so pip/python in
         # the PTY shell resolves to the same environment as the kernel.
-        _py_scripts = os.path.dirname(get_kernel_python())
+        _kernel_py = get_kernel_python()
+        _py_scripts = os.path.dirname(_kernel_py)
         _pty_env = dict(os.environ)
         _pty_env['PATH'] = _py_scripts + os.pathsep + _pty_env.get('PATH', '')
         # Propagate virtual environment if the server is running inside one.
@@ -220,8 +225,27 @@ async def handle_ws_pty(request: web.Request) -> web.WebSocketResponse:
 
         loop = asyncio.get_event_loop()
         shell = "powershell.exe"
+        # Launch PowerShell with -NoExit and an init command that redefines
+        # `python`, `python3`, `pip`, `pip3`, and `pip3.X` to delegate to the
+        # exact kernel Python. This guarantees `pip list` in the PTY terminal
+        # matches the packages the kernel can import — eliminating the
+        # PATH-pip-vs-kernel-pip mismatch users were seeing.
+        _kp = _kernel_py.replace("'", "''")  # PowerShell single-quote escape
+        _init = (
+            "$ErrorActionPreference='SilentlyContinue';"
+            f"$Global:PNF_KERNEL_PY = '{_kp}';"
+            "function python  { & $Global:PNF_KERNEL_PY @args }; "
+            "function python3 { & $Global:PNF_KERNEL_PY @args }; "
+            "function pip     { & $Global:PNF_KERNEL_PY -m pip @args }; "
+            "function pip3    { & $Global:PNF_KERNEL_PY -m pip @args }; "
+            "Write-Host '[pnf-pty] python/pip routed to kernel interpreter:' "
+            "-ForegroundColor Cyan; "
+            "Write-Host \"        $Global:PNF_KERNEL_PY\" -ForegroundColor Cyan;"
+        )
         pty_proc = await loop.run_in_executor(
-            None, lambda: winpty.PtyProcess.spawn(shell, env=_pty_env, dimensions=(24, 220)))
+            None, lambda: winpty.PtyProcess.spawn(
+                [shell, "-NoExit", "-NoLogo", "-Command", _init],
+                env=_pty_env, dimensions=(24, 220)))
 
         def _winpty_read(p):
             """Blocking read — runs in executor thread."""
@@ -388,6 +412,54 @@ async def handle_post_config(request: web.Request) -> web.Response:
     return web.json_response({"status": "ok", "config": _load_pnf_config()})
 
 
+# ── Kernel discovery & switch ─────────────────────────────────────────
+
+async def handle_list_kernels(request: web.Request) -> web.Response:
+    """GET /kernels/list — discover Python interpreters on the system."""
+    loop = asyncio.get_event_loop()
+    items = await loop.run_in_executor(None, discover_pythons)
+    return web.json_response({
+        "active": get_kernel_python(),
+        "items": items,
+        "kernelspec_name": _kernelspec_name_for(get_kernel_python()),
+    })
+
+
+async def handle_switch_kernel(request: web.Request) -> web.Response:
+    """POST /kernel/switch {python, register_jupyter?} — switch PNF kernel
+    interpreter and (optionally) register a matching Jupyter kernelspec."""
+    bridge: KernelBridge = request.app["bridge"]
+    try:
+        data = await request.json()
+    except Exception:
+        raise web.HTTPBadRequest(reason="Invalid JSON")
+    new_path = (data.get("python") or "").strip()
+    if not new_path or not os.path.isfile(new_path):
+        return web.json_response({"ok": False, "error": f"Python not found: {new_path}"}, status=400)
+    register = bool(data.get("register_jupyter", True))
+
+    result: dict = {"ok": True, "python": new_path}
+    # 1) Register Jupyter kernelspec FIRST (so caller can switch jupyter even
+    #    if the PNF restart hiccups). Safe even if same path is registered again.
+    if register:
+        loop = asyncio.get_event_loop()
+        try:
+            ks = await loop.run_in_executor(None, register_jupyter_kernelspec, new_path)
+            result["jupyter_kernelspec"] = ks
+        except Exception as e:
+            result["jupyter_kernelspec"] = {"ok": False, "error": str(e)}
+    # 2) Switch PNF kernel
+    try:
+        sw = await bridge.switch_kernel_python(new_path)
+        result["pnf_kernel"] = {"ok": True, **sw}
+    except Exception as e:
+        logger.exception("switch_kernel_python failed")
+        result["ok"] = False
+        result["pnf_kernel"] = {"ok": False, "error": str(e)}
+        return web.json_response(result, status=500)
+    return web.json_response(result)
+
+
 # ── App factory & runner ──────────────────────────────────────────────────────
 
 async def create_app() -> web.Application:
@@ -403,6 +475,8 @@ async def create_app() -> web.Application:
     app.router.add_post("/interrupt", handle_interrupt)
     app.router.add_get("/config", handle_get_config)
     app.router.add_post("/config", handle_post_config)
+    app.router.add_get("/kernels/list", handle_list_kernels)
+    app.router.add_post("/kernel/switch", handle_switch_kernel)
     # Preflight
     app.router.add_route("OPTIONS", "/{path_info:.*}", lambda r: web.Response())
 

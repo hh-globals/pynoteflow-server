@@ -468,6 +468,230 @@ def get_server_info() -> dict:
         "python_version": sys.version,
         "cwd": os.getcwd(),
         "platform": platform.platform(),
-        "server_version": "1.0.2",
+        "server_version": "1.0.4",
         "kernel_python": kp,
     }
+
+
+# ── Kernel discovery & switching ─────────────────────────────────────────────
+
+import subprocess as _subprocess
+import hashlib as _hashlib
+import glob as _glob
+
+
+def _probe_python(path: str, timeout: float = 4.0) -> dict | None:
+    """Run `path -c <probe>` and return {path, version, impl, prefix} or None."""
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        probe = (
+            "import sys,platform,json;"
+            "print(json.dumps({"
+            "'version': sys.version.split()[0],"
+            "'impl': platform.python_implementation(),"
+            "'prefix': sys.prefix"
+            "}))"
+        )
+        creationflags = 0
+        if os.name == "nt":
+            creationflags = getattr(_subprocess, "CREATE_NO_WINDOW", 0)
+        r = _subprocess.run(
+            [path, "-c", probe],
+            capture_output=True, text=True, timeout=timeout,
+            creationflags=creationflags,
+        )
+        if r.returncode != 0:
+            return None
+        info = _json.loads((r.stdout or "").strip().splitlines()[-1])
+        info["path"] = path
+        return info
+    except Exception:
+        return None
+
+
+def _candidate_python_paths() -> list[str]:
+    """Collect candidate python.exe paths from common locations (no probing)."""
+    out: list[str] = []
+    home = os.path.expanduser("~")
+    appdata = os.environ.get("APPDATA", "")
+    local = os.environ.get("LOCALAPPDATA", "")
+    winapps = os.path.join(local, "Microsoft", "WindowsApps").lower() if local else ""
+
+    # 1) Currently configured kernel python
+    out.append(get_kernel_python())
+    # 2) Server's own python
+    out.append(sys.executable)
+
+    # 3) PATH lookups
+    import shutil as _sh
+    for cmd in ("python", "python3", "python3.11", "python3.12", "python3.10"):
+        p = _sh.which(cmd)
+        if p:
+            out.append(p)
+
+    # 4) Windows py launcher
+    if os.name == "nt":
+        try:
+            r = _subprocess.run(["py", "-0p"], capture_output=True, text=True, timeout=4)
+            for line in (r.stdout or "").splitlines():
+                # lines like " -V:3.11 *        C:\\Path\\python.exe"
+                m = re.search(r"([A-Za-z]:\\[^\s]+python\.exe)", line)
+                if m:
+                    out.append(m.group(1))
+        except Exception:
+            pass
+
+        # 5) uv tool envs
+        if appdata:
+            out.extend(_glob.glob(os.path.join(appdata, "uv", "tools", "*", "Scripts", "python.exe")))
+        # 6) python.org installs
+        if local:
+            out.extend(_glob.glob(os.path.join(local, "Programs", "Python", "Python*", "python.exe")))
+        # 7) Conda envs
+        for root in (os.path.join(home, "Anaconda3"), os.path.join(home, "miniconda3"),
+                     os.path.join(home, "anaconda3"), os.path.join(home, "Miniconda3")):
+            out.append(os.path.join(root, "python.exe"))
+            out.extend(_glob.glob(os.path.join(root, "envs", "*", "python.exe")))
+        # 8) Workspace .venv (cwd at server start)
+        out.append(os.path.join(os.getcwd(), ".venv", "Scripts", "python.exe"))
+    else:
+        # Linux/Mac fallbacks
+        for p in ("/usr/bin/python3", "/usr/local/bin/python3", "/opt/homebrew/bin/python3"):
+            out.append(p)
+
+    # Filter to existing files, dedup case-insensitively, skip Windows Store stubs
+    seen: set[str] = set()
+    final: list[str] = []
+    for p in out:
+        if not p:
+            continue
+        try:
+            real = os.path.realpath(p)
+        except Exception:
+            real = p
+        key = real.lower() if os.name == "nt" else real
+        if key in seen:
+            continue
+        if not os.path.isfile(real):
+            continue
+        # Skip Windows Store app-execution-alias stubs
+        if winapps and winapps in real.lower():
+            # Allow only if it actually works (real install). Most stubs are 0 bytes.
+            try:
+                if os.path.getsize(real) < 1024:
+                    continue
+            except Exception:
+                pass
+        seen.add(key)
+        final.append(real)
+    return final
+
+
+def discover_pythons() -> list[dict]:
+    """Return list of {path, version, impl, prefix, label, is_active}."""
+    active = get_kernel_python()
+    try:
+        active_real = os.path.realpath(active)
+    except Exception:
+        active_real = active
+    results: list[dict] = []
+    for p in _candidate_python_paths():
+        info = _probe_python(p)
+        if not info:
+            continue
+        # Friendly label
+        prefix = info.get("prefix", "")
+        base = os.path.basename(prefix.rstrip(os.sep)) or os.path.basename(p)
+        src = ""
+        lower = p.lower()
+        if "\\uv\\tools\\" in lower or "/uv/tools/" in lower:
+            src = "uv tool"
+        elif "\\anaconda" in lower or "\\miniconda" in lower or "/anaconda" in lower:
+            src = "conda"
+        elif "\\windowsapps\\" in lower:
+            src = "Microsoft Store"
+        elif "\\programs\\python\\" in lower:
+            src = "python.org"
+        elif "\\.venv\\" in lower or "/.venv/" in lower:
+            src = "venv"
+        info["label"] = f"Python {info.get('version','?')} — {base}" + (f" ({src})" if src else "")
+        info["is_active"] = (os.path.realpath(p).lower() == active_real.lower()) if os.name == "nt" else (os.path.realpath(p) == active_real)
+        results.append(info)
+    # Sort: active first, then by version desc, then by label
+    results.sort(key=lambda r: (not r.get("is_active"), r.get("version", ""), r.get("label", "")), reverse=False)
+    # Put active at top by reversing the bool key
+    results.sort(key=lambda r: 0 if r.get("is_active") else 1)
+    return results
+
+
+def _kernelspec_name_for(python_path: str) -> str:
+    """Stable kernelspec name derived from the interpreter path."""
+    h = _hashlib.sha1(os.path.realpath(python_path).lower().encode("utf-8")).hexdigest()[:8]
+    return f"pnf-{h}"
+
+
+def register_jupyter_kernelspec(python_path: str, ensure_ipykernel: bool = True,
+                                timeout: float = 120.0) -> dict:
+    """Install ipykernel (if missing) and register a `--user` kernelspec
+    named pnf-<hash> pointing at *python_path*. Returns dict with status.
+    """
+    if not os.path.isfile(python_path):
+        return {"ok": False, "error": f"Not a file: {python_path}"}
+    name = _kernelspec_name_for(python_path)
+    base = os.path.basename(os.path.dirname(os.path.dirname(python_path))) or os.path.basename(python_path)
+    display = f"PyNoteFlow: {base}"
+    creationflags = getattr(_subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    log: list[str] = []
+
+    def _run(args: list[str]) -> tuple[int, str, str]:
+        try:
+            r = _subprocess.run(args, capture_output=True, text=True,
+                                timeout=timeout, creationflags=creationflags)
+            return r.returncode, (r.stdout or ""), (r.stderr or "")
+        except Exception as e:
+            return -1, "", str(e)
+
+    # Ensure ipykernel is installed (try import first; if missing and allowed, pip install)
+    rc, _so, _se = _run([python_path, "-c", "import ipykernel"])
+    if rc != 0:
+        if not ensure_ipykernel:
+            return {"ok": False, "error": "ipykernel not installed and auto-install disabled"}
+        log.append("Installing ipykernel...")
+        rc, so, se = _run([python_path, "-m", "pip", "install", "--user", "--quiet", "ipykernel"])
+        if rc != 0:
+            return {"ok": False, "error": "pip install ipykernel failed",
+                    "log": log + [so, se]}
+
+    # Register kernelspec
+    log.append(f"Registering kernelspec '{name}'...")
+    rc, so, se = _run([python_path, "-m", "ipykernel", "install", "--user",
+                       "--name", name, "--display-name", display])
+    if rc != 0:
+        return {"ok": False, "error": "ipykernel install failed",
+                "log": log + [so, se], "name": name}
+    return {"ok": True, "name": name, "display_name": display, "log": log + [so]}
+
+
+# Attach a switch method to KernelBridge via monkey-patch (keeps diff small).
+async def _bridge_switch_kernel_python(self: "KernelBridge", new_path: str) -> dict:
+    """Persist new kernel python, stop current kernel, start fresh one."""
+    if not os.path.isfile(new_path):
+        raise ValueError(f"Python executable not found: {new_path}")
+    save_pnf_config({"kernel_python": new_path})
+    # Stop + restart with fresh KernelManager so argv[0] is rebuilt
+    try:
+        await self.stop()
+    except Exception:
+        logger.exception("Error stopping kernel during switch")
+    self.km = None
+    self.kc = None
+    self._iopub_task = self._shell_task = self._stdin_task = None
+    self._exec_map.clear()
+    self._exec_meta.clear()
+    self._install_active = False
+    self._install_active_msg_id = None
+    await self.start()
+    return {"kernel_python": new_path, "version": (_probe_python(new_path) or {}).get("version", "?")}
+
+KernelBridge.switch_kernel_python = _bridge_switch_kernel_python  # type: ignore[attr-defined]
